@@ -55,7 +55,7 @@ HYPERV_AGENT_OPTS = [
     cfg.IPOpt('neutron_metadata_address',
               default='169.254.169.254',
               help=_('Specifies the address which will serve the metadata for'
-                      ' the instance.')),
+                     ' the instance.')),
 ]
 
 NVGRE_OPTS = [
@@ -71,6 +71,12 @@ NVGRE_OPTS = [
               default=None,
               help=_('Specifies the tunnel IP which will be used and '
                      'reported by this host for NVGRE networks.')),
+]
+
+SDN2_OPTS = [
+    cfg.BoolOpt(
+        'enable_support', default=False,
+        help=_('Enables SDN 2.0. Requires Windows Server 2016 or above.')),
 ]
 
 NEUTRON_OPTS = [
@@ -97,4 +103,5 @@ NEUTRON_OPTS = [
 
 cfg.CONF.register_opts(HYPERV_AGENT_OPTS, "AGENT")
 cfg.CONF.register_opts(NVGRE_OPTS, "NVGRE")
+cfg.CONF.register_opts(SDN2_OPTS, "SDN2")
 cfg.CONF.register_opts(NEUTRON_OPTS, 'neutron')

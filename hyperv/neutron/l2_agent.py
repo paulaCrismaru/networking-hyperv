@@ -77,27 +77,29 @@ class HyperVNeutronAgent(hyperv_neutron_agent.HyperVNeutronAgentMixin):
         super(HyperVNeutronAgent, self).__init__(cfg.CONF)
         self._set_agent_state()
 
-    def _set_agent_state(self):
-        configurations = self._get_agent_configurations()
-        self.agent_state = {
-            'binary': 'neutron-hyperv-agent',
-            'host': CONF.host,
-            'configurations': configurations,
-            'agent_type': h_const.AGENT_TYPE_HYPERV,
-            'topic': n_const.L2_AGENT_TOPIC,
-            'start_flag': True}
-
     def _get_agent_configurations(self):
-        configurations = {'vswitch_mappings': self._physical_network_mappings}
+        """Get all the available configurations for the current agent."""
+        conf = {h_const.VSWITCH_MAPPINGS: self._physical_network_mappings}
         if CONF.NVGRE.enable_support:
-            configurations['arp_responder_enabled'] = False
-            configurations['tunneling_ip'] = CONF.NVGRE.provider_tunnel_ip
-            configurations['devices'] = 1
-            configurations['l2_population'] = False
-            configurations['tunnel_types'] = [h_const.TYPE_NVGRE]
-            configurations['enable_distributed_routing'] = False
-            configurations['bridge_mappings'] = {}
-        return configurations
+            conf[h_const.ARP_RESPONDER_ENABLED] = False
+            conf[h_const.BRIDGE_MAPPINGS] = {}
+            conf[h_const.DEVICES] = 1
+            conf[h_const.ENABLE_DISTRIBUTED_ROUTING] = False
+            conf[h_const.L2_POPUlATION] = False
+            conf[h_const.TUNNELING_IP] = CONF.NVGRE.provider_tunnel_ip
+            conf[h_const.TUNNEL_TYPES] = [h_const.TYPE_NVGRE]
+        return conf
+
+    def _set_agent_state(self):
+        """Set the state for the current agent."""
+        self.agent_state = {
+            h_const.AGENT_TYPE: h_const.AGENT_TYPE_HYPERV,
+            h_const.BINARY: 'neutron-hyperv-agent',
+            h_const.CONDITIONS: self._get_agent_configurations(),
+            h_const.HOST: CONF.host,
+            h_const.TOPIC: n_const.L2_AGENT_TOPIC,
+            h_const.START_FLAG: True,
+        }
 
     def _report_state(self):
         try:

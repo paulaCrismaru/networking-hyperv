@@ -45,34 +45,17 @@ synchronized = lockutils.synchronized_with_prefix('n-hv-agent-')
 class HyperVNeutronAgentMixin(object):
 
     def __init__(self, conf=None):
-        """Initializes local configuration of the Hyper-V Neutron Agent.
-
-        :param conf: dict or dict-like object containing the configuration
-                     details used by this Agent. If None is specified, default
-                     values are used instead. conf format is as follows:
-        {
-            'host': string,
-            'AGENT': {'polling_interval': int,
-                       'local_network_vswitch': string,
-                       'physical_network_vswitch_mappings': array,
-                       'enable_metrics_collection': boolean,
-                       'metrics_max_retries': int},
-            'SECURITYGROUP': {'enable_security_group': boolean}
-        }
-
-        For more information on the arguments, their meaning and their default
-        values, visit: http://docs.openstack.org/juno/config-reference/content/
-networking-plugin-hyperv_agent.html
-        """
-
+        """Initializes local configuration of the Hyper-V Neutron Agent."""
         super(HyperVNeutronAgentMixin, self).__init__()
         self._metricsutils = utilsfactory.get_metricsutils()
-        self._utils = utilsfactory.get_networkutils()
-        self._utils.init_caches()
+
         self._network_vswitch_map = {}
         self._port_metric_retries = {}
 
-        self._nvgre_enabled = False
+        # Note(alexcoman): self.client and self.content are initialized by the
+        # _setup_rpc from the `l2_agent.HyperVNeutronAgent` object.
+        self._nvgre_ops = nvgre_ops.HyperVNvgreOps(self.context, self.client)
+
         self._cache_lock = threading.Lock()
 
         conf = conf or {}
@@ -81,7 +64,7 @@ networking-plugin-hyperv_agent.html
 
         self._host = conf.get('host', None)
 
-        self._polling_interval = agent_conf.get('polling_interval', 2)
+
         self._local_network_vswitch = agent_conf.get('local_network_vswitch',
                                                      'private')
         self._worker_count = agent_conf.get('worker_count')
@@ -97,7 +80,17 @@ networking-plugin-hyperv_agent.html
         tpool.set_num_threads(self._worker_count)
 
         self._load_physical_network_mappings(self._phys_net_map)
-        self._init_nvgre()
+        self._setup_operation_agents()
+
+    def _setup_operation_agents(self):
+        """Setup all the available operations agents."""
+        physical_networks = list(self._physical_network_mappings.values())
+        if self._nvgre_ops.enabled:
+            self._nvgre_ops.setup(physical_networks=physical_networks)
+            self._nvgre_ops.init_notifier(self.context, self.client)
+            self._nvgre_ops.tunnel_update(self.context,
+                                          CONF.NVGRE.provider_tunnel_ip,
+                                          constants.TYPE_NVGRE)
 
     def _load_physical_network_mappings(self, phys_net_vswitch_mappings):
         self._physical_network_mappings = collections.OrderedDict()
@@ -110,29 +103,6 @@ networking-plugin-hyperv_agent.html
                 pattern = pattern + '$'
                 vswitch = parts[1].strip()
                 self._physical_network_mappings[pattern] = vswitch
-
-    def _init_nvgre(self):
-        # if NVGRE is enabled, self._nvgre_ops is required in order to properly
-        # set the agent state (see get_agent_configrations method).
-
-        if not CONF.NVGRE.enable_support:
-            return
-
-        if not CONF.NVGRE.provider_tunnel_ip:
-            err_msg = _('enable_nvgre_support is set to True, but provider '
-                        'tunnel IP is not configured. Check neutron.conf '
-                        'config file.')
-            LOG.error(err_msg)
-            raise exception.NetworkingHyperVException(err_msg)
-
-        self._nvgre_enabled = True
-        self._nvgre_ops = nvgre_ops.HyperVNvgreOps(
-            list(self._physical_network_mappings.values()))
-
-        self._nvgre_ops.init_notifier(self.context, self.client)
-        self._nvgre_ops.tunnel_update(self.context,
-                                      CONF.NVGRE.provider_tunnel_ip,
-                                      constants.TYPE_NVGRE)
 
     def _get_vswitch_for_physical_network(self, phys_network_name):
         for pattern in self._physical_network_mappings:
@@ -399,14 +369,7 @@ networking-plugin-hyperv_agent.html
         LOG.info(_LI("Hyper-V VM vNIC removed: %s"), port_name)
         self._removed_ports.add(port_name)
 
-    def _create_event_listeners(self):
-        event_callback_pairs = [
-            (self._utils.EVENT_TYPE_CREATE, self._process_added_port_event),
-            (self._utils.EVENT_TYPE_DELETE, self._process_removed_port_event)]
 
-        for event_type, callback in event_callback_pairs:
-            listener = self._utils.get_vnic_event_listener(event_type)
-            eventlet.spawn_n(listener, callback)
 
     def _update_port_status_cache(self, device, device_bound=True):
         with self._cache_lock:

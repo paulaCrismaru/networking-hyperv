@@ -20,6 +20,7 @@ import six
 import uuid
 
 from hyperv.common.i18n import _LI, _LW, _LE  # noqa
+from hyperv.common import base as hyperv_base
 from hyperv.neutron import constants
 from hyperv.neutron import hyperv_agent_notifier
 from hyperv.neutron import neutron_client
@@ -31,10 +32,12 @@ CONF.import_group('NVGRE', 'hyperv.neutron.config')
 LOG = logging.getLogger(__name__)
 
 
-class HyperVNvgreOps(object):
+class HyperVNvgreOps(hyperv_base.Operations):
 
-    def __init__(self, physical_networks):
-        self.topic = constants.AGENT_TOPIC
+    def __init__(self):
+        super(HyperVNvgreOps, self).__init__()
+        self._enabled = CONF.NVGRE.enable_support
+
         self._vswitch_ips = {}
         self._tunneling_agents = {}
         self._nvgre_ports = []
@@ -42,9 +45,23 @@ class HyperVNvgreOps(object):
 
         self._hyperv_utils = utilsfactory.get_networkutils()
         self._nvgre_utils = utilsfactory.get_nvgreutils()
-        self._n_client = neutron_client.NeutronAPIClient()
 
-        self._init_nvgre(physical_networks)
+    def setup(self, physical_networks):
+        """Setup the current operations provider."""
+
+        # Note(alexcoman): If NVGRE is enabled, self._nvgre_ops is required
+        # in order to properly set the agent state.
+        # For more information see get_agent_configrations method.
+
+        if not self.enabled:
+            return
+
+        if not CONF.NVGRE.provider_tunnel_ip:
+            err_msg = _('enable_nvgre_support is set to True, but provider '
+                        'tunnel IP is not configured. Check neutron.conf '
+                        'config file.')
+            LOG.error(err_msg)
+            raise exception.NetworkingHyperVException(err_msg)
 
     def init_notifier(self, context, rpc_client):
         self.context = context
@@ -62,7 +79,7 @@ class HyperVNvgreOps(object):
             self._vswitch_ips[network] = ip_addr
 
     def _refresh_tunneling_agents(self):
-        self._tunneling_agents.update(self._n_client.get_tunneling_agents())
+        self._tunneling_agents.update(self.neutron_client.get_tunneling_agents())
 
     def lookup_update(self, kwargs):
         lookup_ip = kwargs.get('lookup_ip')
@@ -98,7 +115,7 @@ class HyperVNvgreOps(object):
     def bind_nvgre_port(self, segmentation_id, network_name, port_id):
         mac_addr = self._hyperv_utils.get_vnic_mac_address(port_id)
         provider_addr = self._nvgre_utils.get_network_iface_ip(network_name)[0]
-        customer_addr = self._n_client.get_port_ip_address(port_id)
+        customer_addr = self.neutron_client.get_port_ip_address(port_id)
 
         if not provider_addr or not customer_addr:
             LOG.warning(_LW('Cannot bind NVGRE port. Could not determine '
@@ -130,13 +147,13 @@ class HyperVNvgreOps(object):
                                       'customer_vsid': segmentation_id})
 
     def bind_nvgre_network(self, segmentation_id, net_uuid, vswitch_name):
-        subnets = self._n_client.get_network_subnets(net_uuid)
+        subnets = self.neutron_client.get_network_subnets(net_uuid)
         if len(subnets) > 1:
             LOG.warning(_LW("Multiple subnets in the same network is not "
                             "supported."))
         subnet = subnets[0]
         try:
-            cidr, gw = self._n_client.get_network_subnet_cidr_and_gateway(
+            cidr, gw = self.neutron_client.get_network_subnet_cidr_and_gateway(
                 subnet)
 
             cust_route_string = vswitch_name + cidr + str(segmentation_id)
@@ -177,7 +194,7 @@ class HyperVNvgreOps(object):
 
     def refresh_nvgre_records(self, **kwargs):
         self._refresh_tunneling_agents()
-        ports = self._n_client.get_network_ports(**kwargs)
+        ports = self.neutron_client.get_network_ports(**kwargs)
 
         # process ports that were not processed yet.
         # process ports that are bound to tunneling_agents.
