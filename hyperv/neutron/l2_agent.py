@@ -14,7 +14,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import platform
 import sys
 
 from neutron.agent.common import config
@@ -23,14 +22,14 @@ from neutron.agent import securitygroups_rpc as sg_rpc
 from neutron.common import config as common_config
 from neutron.common import rpc as n_rpc
 from neutron.common import topics
-from neutron import context
+from neutron import context as neutron_context
 from neutron_lib import constants as n_const
 from oslo_config import cfg
 from oslo_log import log as logging
 import oslo_messaging
 from oslo_service import loopingcall
 
-from hyperv.common.i18n import _, _LE, _LI  # noqa
+from hyperv.common.i18n import _LE, _LI
 from hyperv.neutron import constants as h_const
 from hyperv.neutron import hyperv_neutron_agent
 
@@ -68,59 +67,58 @@ class HyperVSecurityCallbackMixin(sg_rpc.SecurityGroupAgentRpcCallbackMixin):
         self.sg_agent = sg_agent
 
 
-class HyperVNeutronAgent(hyperv_neutron_agent.HyperVNeutronAgentMixin):
+class HyperVNeutronAgent(hyperv_neutron_agent.HyperVNeutronAgent):
+
     # Set RPC API version to 1.1 by default.
     target = oslo_messaging.Target(version='1.1')
 
     def __init__(self):
-        self._setup_rpc()
         super(HyperVNeutronAgent, self).__init__(cfg.CONF)
-        self._set_agent_state()
-
-    def _set_agent_state(self):
-        configurations = self._get_agent_configurations()
-        self.agent_state = {
-            'binary': 'neutron-hyperv-agent',
-            'host': CONF.host,
-            'configurations': configurations,
-            'agent_type': h_const.AGENT_TYPE_HYPERV,
-            'topic': n_const.L2_AGENT_TOPIC,
-            'start_flag': True}
 
     def _get_agent_configurations(self):
-        configurations = {'vswitch_mappings': self._physical_network_mappings}
+        """Get all the available configurations for the current agent."""
+        conf = {h_const.VSWITCH_MAPPINGS: self._physical_network_mappings}
         if CONF.NVGRE.enable_support:
-            configurations['arp_responder_enabled'] = False
-            configurations['tunneling_ip'] = CONF.NVGRE.provider_tunnel_ip
-            configurations['devices'] = 1
-            configurations['l2_population'] = False
-            configurations['tunnel_types'] = [h_const.TYPE_NVGRE]
-            configurations['enable_distributed_routing'] = False
-            configurations['bridge_mappings'] = {}
-        return configurations
+            conf[h_const.ARP_RESPONDER_ENABLED] = False
+            conf[h_const.BRIDGE_MAPPINGS] = {}
+            conf[h_const.DEVICES] = 1
+            conf[h_const.ENABLE_DISTRIBUTED_ROUTING] = False
+            conf[h_const.L2_POPUlATION] = False
+            conf[h_const.TUNNELING_IP] = CONF.NVGRE.provider_tunnel_ip
+            conf[h_const.TUNNEL_TYPES] = [h_const.TYPE_NVGRE]
+        return conf
+
+    def _set_agent_state(self):
+        """Set the state for the current agent."""
+        self._agent_state = {
+            h_const.AGENT_TYPE: h_const.AGENT_TYPE_HYPERV,
+            h_const.BINARY: 'neutron-hyperv-agent',
+            h_const.CONDITIONS: self._get_agent_configurations(),
+            h_const.HOST: CONF.host,
+            h_const.TOPIC: n_const.L2_AGENT_TOPIC,
+            h_const.START_FLAG: True,
+        }
 
     def _report_state(self):
         try:
-            self.state_rpc.report_state(self.context,
-                                        self.agent_state)
-            self.agent_state.pop('start_flag', None)
+            self._state_rpc.report_state(self._context,
+                                         self._agent_state)
+            self._agent_state.pop('start_flag', None)
         except Exception:
             LOG.exception(_LE("Failed reporting state!"))
 
     def _setup_rpc(self):
-        self.agent_id = 'hyperv_%s' % platform.node()
-        self.topic = topics.AGENT
-        self.plugin_rpc = agent_rpc.PluginApi(topics.PLUGIN)
-        self.sg_plugin_rpc = sg_rpc.SecurityGroupServerRpcApi(topics.PLUGIN)
+        self._plugin_rpc = agent_rpc.PluginApi(topics.PLUGIN)
+        self._sg_plugin_rpc = sg_rpc.SecurityGroupServerRpcApi(topics.PLUGIN)
 
         # RPC network init
-        self.context = context.get_admin_context_without_session()
-        self.sec_groups_agent = HyperVSecurityAgent(self.context,
-                                                    self.sg_plugin_rpc)
-        self.state_rpc = agent_rpc.PluginReportStateAPI(topics.PLUGIN)
+        self._context = neutron_context.get_admin_context_without_session()
+        self._sec_groups_agent = HyperVSecurityAgent(self._context,
+                                                     self._sg_plugin_rpc)
+        self._state_rpc = agent_rpc.PluginReportStateAPI(topics.PLUGIN)
 
         # Handle updates from service
-        self.endpoints = [self]
+        self._endpoints = [self]
         # Define the listening consumers for the agent
         consumers = [[topics.PORT, topics.UPDATE],
                      [topics.NETWORK, topics.DELETE],
@@ -129,11 +127,11 @@ class HyperVNeutronAgent(hyperv_neutron_agent.HyperVNeutronAgentMixin):
             consumers.append([h_const.TUNNEL, topics.UPDATE])
             consumers.append([h_const.LOOKUP, h_const.UPDATE])
 
-        self.connection = agent_rpc.create_consumers(self.endpoints,
-                                                     self.topic,
-                                                     consumers)
+        self._connection = agent_rpc.create_consumers(self._endpoints,
+                                                      self._topic,
+                                                      consumers)
 
-        self.client = n_rpc.get_client(self.target)
+        self._client = n_rpc.get_client(self.target)
         report_interval = CONF.AGENT.report_interval
         if report_interval:
             heartbeat = loopingcall.FixedIntervalLoopingCall(

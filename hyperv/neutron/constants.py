@@ -30,5 +30,24 @@ TYPE_FLAT = 'flat'
 TYPE_LOCAL = 'local'
 TYPE_VLAN = 'vlan'
 TYPE_NVGRE = 'gre'
+TYPE_SDN2 = 'sdn2'  # FIXME(alexcoman): This value must be changed.
 
 IPV4_DEFAULT = '0.0.0.0'
+
+# Keys for agent state
+AGENT_TYPE = "agent_type"
+BINARY = "binary"
+CONDITIONS = "configurations"
+HOST = "host"
+TOPIC = "topic"
+START_FLAG = "start_flag"
+
+# Keys for the agent configurations
+ARP_RESPONDER_ENABLED = "arp_responder_enabled"
+BRIDGE_MAPPINGS = "bridge_mappings"
+DEVICES = "devices"
+ENABLE_DISTRIBUTED_ROUTING = "enable_distributed_routing"
+L2_POPUlATION = "l2_population"
+VSWITCH_MAPPINGS = "vswitch_mappings"
+TUNNELING_IP = "tunneling_ip"
+TUNNEL_TYPES = "tunnel_types"
