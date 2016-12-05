@@ -32,3 +32,14 @@ TYPE_VLAN = 'vlan'
 TYPE_NVGRE = 'gre'
 
 IPV4_DEFAULT = '0.0.0.0'
+
+GET = "GET"
+POST = "POST"
+PUT = "PUT"
+PATCH = "PATCH"
+DELETE = "DELETE"
+
+DELETING = "Deleting"
+FAILED = "Failed"
+SUCCEEDED = "Succeeded"
+UPDATING = "Updating"
