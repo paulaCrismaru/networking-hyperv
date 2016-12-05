@@ -77,6 +77,25 @@ SDN2_OPTS = [
     cfg.BoolOpt(
         'enable_support', default=False,
         help=_('Enables SDN 2.0. Requires Windows Server 2016 or above.')),
+    cfg.StrOpt(
+        "url", default="http://127.0.0.1/",
+        help="The base URL where the agent looks for Network Controller API."),
+    cfg.StrOpt(
+        'username',
+        help="The username required for connecting to the Netowork "
+             "Controller API."),
+    cfg.StrOpt(
+        'password',
+        help="The password required for connecting to the Netowork "
+             "Controller API.",
+        secret=True),
+    cfg.BoolOpt(
+        "https_allow_insecure", default=False,
+        help="Whether to disable the validation of HTTPS certificates."),
+    cfg.StrOpt(
+        "https_ca_bundle", default=None,
+        help="The path to a CA_BUNDLE file or directory with "
+             "certificates of trusted CAs."),
 ]
 
 NEUTRON_OPTS = [
