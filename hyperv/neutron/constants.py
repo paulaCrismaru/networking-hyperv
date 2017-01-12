@@ -16,6 +16,7 @@
 # Topic for tunnel notifications between the plugin and agent
 AGENT_TOPIC = 'q-agent-notifier'
 AGENT_TYPE_HYPERV = 'HyperV agent'
+AGENT_TYPE_HNV = "HNV agent"
 VIF_TYPE_HYPERV = 'hyperv'
 
 TUNNEL = 'tunnel'
@@ -32,3 +33,11 @@ TYPE_VLAN = 'vlan'
 TYPE_NVGRE = 'gre'
 
 IPV4_DEFAULT = '0.0.0.0'
+
+NET_CFG_INSTANCE_ID = "{56785678-a0e5-4a26-bc9b-c0cba27311a3}"
+CDN_LABEL_STRING = "TestCdn"
+CDN_LABEL_ID = 1111
+PROFILE_NAME = "Testprofile"
+VENDOR_ID = "{1FA41B39-B444-4E43-B35A-E1F7985FD548}"
+VENDOR_NAME = "NetworkController"
+PROFILE_DATA = 1

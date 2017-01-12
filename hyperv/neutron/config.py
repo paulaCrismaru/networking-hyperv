@@ -19,6 +19,10 @@ from oslo_config import cfg
 from hyperv.common.i18n import _
 
 HYPERV_AGENT_OPTS = [
+    cfg.StrOpt(
+        "logical_network", default=None, required=True,
+        help=_("This is the logical network on top of which tenant network "
+               "traffic will be encapsulated.")),
     cfg.ListOpt(
         'physical_network_vswitch_mappings',
         default=[],
