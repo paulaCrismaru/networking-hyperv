@@ -14,9 +14,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from neutron_lib.utils import net
 from oslo_config import cfg
 
 from hyperv.common.i18n import _
+
 
 HYPERV_AGENT_OPTS = [
     cfg.StrOpt(
@@ -99,6 +101,83 @@ NEUTRON_OPTS = [
                help='auth strategy for connecting to neutron in admin context')
 ]
 
+METADATA_PROXY_HANDLER_OPTS = [
+    cfg.StrOpt('auth_ca_cert',
+               help=_("Certificate Authority public key (CA cert) "
+                      "file for ssl")),
+    cfg.StrOpt('nova_metadata_ip', default='127.0.0.1',
+               help=_("IP address used by Nova metadata server.")),
+    cfg.PortOpt('nova_metadata_port',
+                default=8775,
+                help=_("TCP Port used by Nova metadata server.")),
+    cfg.StrOpt('metadata_proxy_shared_secret',
+               default='',
+               help=_('When proxying metadata requests, Neutron signs the '
+                      'Instance-ID header with a shared secret to prevent '
+                      'spoofing. You may select any string for a secret, '
+                      'but it must match here and in the configuration used '
+                      'by the Nova Metadata Server. NOTE: Nova uses the same '
+                      'config key, but in [neutron] section.'),
+               secret=True),
+    cfg.StrOpt('nova_metadata_protocol',
+               default='http',
+               choices=['http', 'https'],
+               help=_("Protocol to access nova metadata, http or https")),
+    cfg.BoolOpt('nova_metadata_insecure', default=False,
+                help=_("Allow to perform insecure SSL (https) requests to "
+                       "nova metadata")),
+    cfg.StrOpt('nova_client_cert',
+               default='',
+               help=_("Client certificate for nova metadata api server.")),
+    cfg.StrOpt('nova_client_priv_key',
+               default='',
+               help=_("Private key of client certificate."))
+]
+
+METADATA_PROXY = [
+    cfg.StrOpt('host', default=net.get_hostname(),
+               sample_default='example.domain',
+               help=_("Hostname to be used by the Neutron server, agents and "
+                      "services running on this machine. All the agents and "
+                      "services running on this machine must use the same "
+                      "host value.")),
+    cfg.StrOpt('bind_host', default='0.0.0.0',
+               help=_("The host IP to bind to")),
+    cfg.PortOpt('bind_port', default=8080,
+                help=_("The port to bind to")),
+    cfg.StrOpt('auth_ca_cert',
+               help=_("Certificate Authority public key (CA cert) "
+                      "file for ssl")),
+    cfg.StrOpt('nova_metadata_ip', default='127.0.0.1',
+               help=_("IP address used by Nova metadata server.")),
+    cfg.PortOpt('nova_metadata_port',
+                default=8775,
+                help=_("TCP Port used by Nova metadata server.")),
+    cfg.StrOpt('proxy_shared_secret',
+               default='',
+               help=_('When proxying metadata requests, Neutron signs the '
+                      'Instance-ID header with a shared secret to prevent '
+                      'spoofing. You may select any string for a secret, '
+                      'but it must match here and in the configuration used '
+                      'by the Nova Metadata Server. NOTE: Nova uses the same '
+                      'config key, but in [neutron] section.'),
+               secret=True),
+    cfg.StrOpt('nova_metadata_protocol',
+               default='http',
+               choices=['http', 'https'],
+               help=_("Protocol to access nova metadata, http or https")),
+    cfg.BoolOpt('nova_metadata_insecure', default=False,
+                help=_("Allow to perform insecure SSL (https) requests to "
+                       "nova metadata")),
+    cfg.StrOpt('nova_client_cert',
+               default='',
+               help=_("Client certificate for nova metadata api server.")),
+    cfg.StrOpt('nova_client_priv_key',
+               default='',
+               help=_("Private key of client certificate.")),
+]
+
 cfg.CONF.register_opts(HYPERV_AGENT_OPTS, "AGENT")
 cfg.CONF.register_opts(NVGRE_OPTS, "NVGRE")
 cfg.CONF.register_opts(NEUTRON_OPTS, 'neutron')
+cfg.CONF.register_opts(METADATA_PROXY, "metadata")
