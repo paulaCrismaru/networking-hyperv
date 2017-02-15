@@ -14,36 +14,74 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import collections
-import re
-import time
+# pylint: disable=invalid-name, unused-argument, protected-access
 
-import eventlet
-from eventlet import tpool
+import platform
+import sys
+
+from neutron.agent.common import config as neutron_config
+from neutron.agent.l2.extensions import qos as qos_extension
+from neutron.agent import rpc as agent_rpc
+from neutron.agent import securitygroups_rpc as sg_rpc
+from neutron.common import config as common_config
+from neutron.common import topics
+from neutron_lib import constants as n_constant
 from os_win import exceptions
 from os_win import utilsfactory
 from oslo_concurrency import lockutils
 from oslo_config import cfg
 from oslo_log import log as logging
-import threading
+import oslo_messaging
 
-from hyperv.common.i18n import _, _LE, _LW, _LI  # noqa
+from hyperv.common import i18n
 from hyperv.neutron import _common_utils as c_util
-from hyperv.neutron import constants
+from hyperv.neutron import base as hyperv_base
+from hyperv.neutron import constants as h_constant
 from hyperv.neutron import exception
 from hyperv.neutron import nvgre_ops
+from hyperv.neutron import trunk_driver
 
 CONF = cfg.CONF
 CONF.import_group('NVGRE', 'hyperv.neutron.config')
 LOG = logging.getLogger(__name__)
 
 _port_synchronized = c_util.get_port_synchronized_decorator('n-hv-agent-')
-synchronized = lockutils.synchronized_with_prefix('n-hv-agent-')
+_synchronized = lockutils.synchronized_with_prefix('n-hv-agent-')
 
 
-class HyperVNeutronAgentMixin(object):
+class HyperVSecurityAgent(sg_rpc.SecurityGroupAgentRpc):
 
-    def __init__(self, conf=None):
+    def __init__(self, context, plugin_rpc):
+        super(HyperVSecurityAgent, self).__init__(context, plugin_rpc)
+        if sg_rpc.is_firewall_enabled():
+            self._setup_rpc()
+
+    @property
+    def use_enhanced_rpc(self):
+        return True
+
+    def _setup_rpc(self):
+        self.topic = topics.AGENT
+        self.endpoints = [HyperVSecurityCallbackMixin(self)]
+        consumers = [[topics.SECURITY_GROUP, topics.UPDATE]]
+
+        self.connection = agent_rpc.create_consumers(self.endpoints,
+                                                     self.topic,
+                                                     consumers)
+
+
+class HyperVSecurityCallbackMixin(sg_rpc.SecurityGroupAgentRpcCallbackMixin):
+
+    target = oslo_messaging.Target(version='1.3')
+
+    def __init__(self, sg_agent):
+        super(HyperVSecurityCallbackMixin, self).__init__()
+        self.sg_agent = sg_agent
+
+
+class HyperVNeutronAgent(hyperv_base.Layer2Agent):
+
+    def __init__(self, config=None):
         """Initializes local configuration of the Hyper-V Neutron Agent.
 
         :param conf: dict or dict-like object containing the configuration
@@ -64,62 +102,78 @@ class HyperVNeutronAgentMixin(object):
 networking-plugin-hyperv_agent.html
         """
 
-        super(HyperVNeutronAgentMixin, self).__init__()
+        super(HyperVNeutronAgent, self).__init__(config)
+        self._agent_id = 'hyperv_%s' % platform.node()
+
+        self._qos_ext = None
+        self._nvgre_enabled = False
+
         self._metricsutils = utilsfactory.get_metricsutils()
-        self._utils = utilsfactory.get_networkutils()
-        self._utils.init_caches()
-        self._network_vswitch_map = {}
         self._port_metric_retries = {}
 
-        self._nvgre_enabled = False
-        self._cache_lock = threading.Lock()
-
-        conf = conf or {}
-        agent_conf = conf.get('AGENT', {})
-        security_conf = conf.get('SECURITYGROUP', {})
-
-        self._host = conf.get('host', None)
-
-        self._polling_interval = agent_conf.get('polling_interval', 2)
-        self._local_network_vswitch = agent_conf.get('local_network_vswitch',
-                                                     'private')
-        self._worker_count = agent_conf.get('worker_count')
-        self._phys_net_map = agent_conf.get(
-            'physical_network_vswitch_mappings', [])
-        self.enable_metrics_collection = agent_conf.get(
+        agent_conf = self._config.get('AGENT', {})
+        security_conf = self._config.get('SECURITYGROUP', {})
+        self._enable_metrics_collection = agent_conf.get(
             'enable_metrics_collection', False)
         self._metrics_max_retries = agent_conf.get('metrics_max_retries', 100)
-
-        self.enable_security_groups = security_conf.get(
+        self._enable_security_groups = security_conf.get(
             'enable_security_group', False)
 
-        tpool.set_num_threads(self._worker_count)
+        self._init_nvgre()
 
-        self._load_physical_network_mappings(self._phys_net_map)
+    def _get_agent_configurations(self):
+        configurations = {'vswitch_mappings': self._physical_network_mappings}
+        if CONF.NVGRE.enable_support:
+            configurations['arp_responder_enabled'] = False
+            configurations['tunneling_ip'] = CONF.NVGRE.provider_tunnel_ip
+            configurations['devices'] = 1
+            configurations['l2_population'] = False
+            configurations['tunnel_types'] = [h_constant.TYPE_NVGRE]
+            configurations['enable_distributed_routing'] = False
+            configurations['bridge_mappings'] = {}
+        return configurations
 
-    def _load_physical_network_mappings(self, phys_net_vswitch_mappings):
-        self._physical_network_mappings = collections.OrderedDict()
-        for mapping in phys_net_vswitch_mappings:
-            parts = mapping.split(':')
-            if len(parts) != 2:
-                LOG.debug('Invalid physical network mapping: %s', mapping)
-            else:
-                pattern = re.escape(parts[0].strip()).replace('\\*', '.*')
-                pattern = pattern + '$'
-                vswitch = parts[1].strip()
-                self._physical_network_mappings[pattern] = vswitch
+    def _set_agent_state(self):
+        configurations = self._get_agent_configurations()
+        self.agent_state = {
+            'binary': 'neutron-hyperv-agent',
+            'host': CONF.host,
+            'configurations': configurations,
+            'agent_type': h_constant.AGENT_TYPE_HYPERV,
+            'topic': n_constant.L2_AGENT_TOPIC,
+            'start_flag': True
+        }
 
-    def init_nvgre(self):
+    def _setup(self):
+        """Setup the layer two agent."""
+        super(HyperVNeutronAgent, self)._setup()
+
+        self._sg_plugin_rpc = sg_rpc.SecurityGroupServerRpcApi(topics.PLUGIN)
+        self._sec_groups_agent = HyperVSecurityAgent(self._context,
+                                                     self._sg_plugin_rpc)
+        self._vlan_driver = trunk_driver.HyperVTrunkDriver(self._context)
+        if CONF.NVGRE.enable_support:
+            self._consumers.append([h_constant.TUNNEL, topics.UPDATE])
+            self._consumers.append([h_constant.LOOKUP, h_constant.UPDATE])
+
+    def _setup_qos_extension(self):
+        """Setup the QOS extension if it is required."""
+        if not CONF.AGENT.enable_qos_extension:
+            return
+        self._qos_ext = qos_extension.QosAgentExtension()
+        self._qos_ext.consume_api(self)
+        self._qos_ext.initialize(self.connection, 'hyperv')
+
+    def _init_nvgre(self):
         # if NVGRE is enabled, self._nvgre_ops is required in order to properly
         # set the agent state (see get_agent_configrations method).
-
-        if not CONF.NVGRE.enable_support:
+        if not self._config.NVGRE.enable_support:
             return
 
-        if not CONF.NVGRE.provider_tunnel_ip:
-            err_msg = _('enable_nvgre_support is set to True, but provider '
-                        'tunnel IP is not configured. Check neutron.conf '
-                        'config file.')
+        if not self._config.NVGRE.provider_tunnel_ip:
+            err_msg = i18n._('enable_nvgre_support is set to True, but '
+                             'provider tunnel IP is not configured. '
+                             'Check neutron.conf config file.')
             LOG.error(err_msg)
             raise exception.NetworkingHyperVException(err_msg)
 
@@ -127,182 +181,97 @@ networking-plugin-hyperv_agent.html
         self._nvgre_ops = nvgre_ops.HyperVNvgreOps(
             list(self._physical_network_mappings.values()))
 
-        self._nvgre_ops.init_notifier(self.context, self.client)
-        self._nvgre_ops.tunnel_update(self.context,
+        self._nvgre_ops.init_notifier(self._context, self._client)
+        self._nvgre_ops.tunnel_update(self._context,
                                       CONF.NVGRE.provider_tunnel_ip,
-                                      constants.TYPE_NVGRE)
-
-    def _get_vswitch_for_physical_network(self, phys_network_name):
-        for pattern in self._physical_network_mappings:
-            if phys_network_name is None:
-                phys_network_name = ''
-            if re.match(pattern, phys_network_name):
-                return self._physical_network_mappings[pattern]
-        # Not found in the mappings, the vswitch has the same name
-        return phys_network_name
-
-    def _get_network_vswitch_map_by_port_id(self, port_id):
-        for network_id, map in self._network_vswitch_map.items():
-            if port_id in map['ports']:
-                return (network_id, map)
-
-        # if the port was not found, just return (None, None)
-        return (None, None)
-
-    def network_delete(self, context, network_id=None):
-        LOG.debug("network_delete received. "
-                  "Deleting network %s", network_id)
-        # The network may not be defined on this agent
-        if network_id in self._network_vswitch_map:
-            self._reclaim_local_network(network_id)
-        else:
-            LOG.debug("Network %s not defined on agent.", network_id)
-
-    def port_delete(self, context, port_id=None):
-        pass
-
-    def port_update(self, context, port=None, network_type=None,
-                    segmentation_id=None, physical_network=None):
-        LOG.debug("port_update received: %s", port['id'])
-
-        if self._utils.vnic_port_exists(port['id']):
-            self._treat_vif_port(
-                port['id'], port['network_id'],
-                network_type, physical_network,
-                segmentation_id, port['admin_state_up'])
-        else:
-            LOG.debug("No port %s defined on agent.", port['id'])
-
-    def tunnel_update(self, context, **kwargs):
-        LOG.info(_LI('tunnel_update received: kwargs: %s'), kwargs)
-        tunnel_ip = kwargs.get('tunnel_ip')
-        if tunnel_ip == CONF.NVGRE.provider_tunnel_ip:
-            # the notification should be ignored if it originates from this
-            # node.
-            return
-
-        tunnel_type = kwargs.get('tunnel_type')
-        self._nvgre_ops.tunnel_update(context, tunnel_ip, tunnel_type)
-
-    def lookup_update(self, context, **kwargs):
-        self._nvgre_ops.lookup_update(kwargs)
+                                      h_constant.TYPE_NVGRE)
 
     def _get_vswitch_name(self, network_type, physical_network):
-        if network_type != constants.TYPE_LOCAL:
+        if network_type != h_constant.TYPE_LOCAL:
             vswitch_name = self._get_vswitch_for_physical_network(
                 physical_network)
         else:
             vswitch_name = self._local_network_vswitch
         return vswitch_name
 
-    def _provision_network(self, port_id,
-                           net_uuid, network_type,
-                           physical_network,
-                           segmentation_id):
-        LOG.info(_LI("Provisioning network %s"), net_uuid)
+    def _provision_network(self, port_id, net_uuid, network_type,
+                           physical_network, segmentation_id):
+        """Provision the network with the received information."""
+        LOG.info(i18n._LI("Provisioning network %s"), net_uuid)
 
         vswitch_name = self._get_vswitch_name(network_type, physical_network)
-        if network_type == constants.TYPE_VLAN:
-            # Nothing to do
-            pass
-        elif network_type == constants.TYPE_NVGRE and self._nvgre_enabled:
-            self._nvgre_ops.bind_nvgre_network(
-                segmentation_id, net_uuid, vswitch_name)
-        elif network_type == constants.TYPE_FLAT:
-            # Nothing to do
-            pass
-        elif network_type == constants.TYPE_LOCAL:
+        if network_type == h_constant.TYPE_VLAN:
+            pass    # Nothing to do
+        elif network_type == h_constant.TYPE_FLAT:
+            pass    # Nothing to do
+        elif network_type == h_constant.TYPE_LOCAL:
             # TODO(alexpilotti): Check that the switch type is private
-            # or create it if not existing
+            # or create it if not existing.
             pass
+        elif network_type == h_constant.TYPE_NVGRE and self._nvgre_enabled:
+            self._nvgre_ops.bind_nvgre_network(segmentation_id, net_uuid,
+                                               vswitch_name)
         else:
             raise exception.NetworkingHyperVException(
-                (_("Cannot provision unknown network type %(network_type)s"
-                   " for network %(net_uuid)s") %
+                (i18n._("Cannot provision unknown network type "
+                        "%(network_type)s for network %(net_uuid)s") %
                  dict(network_type=network_type, net_uuid=net_uuid)))
 
-        map = {
+        vswitch_map = {
             'network_type': network_type,
             'vswitch_name': vswitch_name,
             'ports': [],
             'vlan_id': segmentation_id}
-        self._network_vswitch_map[net_uuid] = map
+        self._network_vswitch_map[net_uuid] = vswitch_map
 
-    def _reclaim_local_network(self, net_uuid):
-        LOG.info(_LI("Reclaiming local network %s"), net_uuid)
-        del self._network_vswitch_map[net_uuid]
-
-    def _port_bound(self, port_id,
-                    net_uuid,
-                    network_type,
-                    physical_network,
+    def _port_bound(self, port_id, network_id, network_type, physical_network,
                     segmentation_id):
-        LOG.debug("Binding port %s", port_id)
+        """Bind the port to the recived network."""
+        super(HyperVNeutronAgent, self)._port_bound(
+            port_id, network_id, network_type, physical_network,
+            segmentation_id
+        )
+        vswitch_map = self._network_vswitch_map[network_id]
 
-        if net_uuid not in self._network_vswitch_map:
-            self._provision_network(
-                port_id, net_uuid, network_type,
-                physical_network, segmentation_id)
-
-        map = self._network_vswitch_map[net_uuid]
-        map['ports'].append(port_id)
-
-        self._utils.connect_vnic_to_vswitch(map['vswitch_name'], port_id)
-
-        if network_type == constants.TYPE_VLAN:
+        if network_type == h_constant.TYPE_VLAN:
             self._vlan_driver.bind_vlan_port(port_id, segmentation_id)
-        elif network_type == constants.TYPE_NVGRE and self._nvgre_enabled:
+        elif network_type == h_constant.TYPE_NVGRE and self._nvgre_enabled:
             self._nvgre_ops.bind_nvgre_port(
-                segmentation_id, map['vswitch_name'], port_id)
-        elif network_type == constants.TYPE_FLAT:
-            # Nothing to do
-            pass
-        elif network_type == constants.TYPE_LOCAL:
-            # Nothing to do
-            pass
+                segmentation_id, vswitch_map['vswitch_name'], port_id)
+        elif network_type == h_constant.TYPE_FLAT:
+            pass    # Nothing to do
+        elif network_type == h_constant.TYPE_LOCAL:
+            pass    # Nothing to do
         else:
-            LOG.error(_LE('Unsupported network type %s'), network_type)
+            LOG.error(i18n._LE('Unsupported network type %s'), network_type)
 
-        if self.enable_metrics_collection:
+        if self._enable_metrics_collection:
             self._utils.add_metrics_collection_acls(port_id)
             self._port_metric_retries[port_id] = self._metrics_max_retries
 
-    def _port_unbound(self, port_id, vnic_deleted=False):
-        (net_uuid, map) = self._get_network_vswitch_map_by_port_id(port_id)
-
-        if not net_uuid:
-            LOG.debug('Port %s was not found on this agent.', port_id)
-            return
-
-        LOG.debug("Unbinding port %s", port_id)
-        self._utils.remove_switch_port(port_id, vnic_deleted)
-        map['ports'].remove(port_id)
-
-        if not map['ports']:
-            self._reclaim_local_network(net_uuid)
-
     def _port_enable_control_metrics(self):
-        if not self.enable_metrics_collection:
+        if not self._enable_metrics_collection:
             return
 
         for port_id in list(self._port_metric_retries.keys()):
             try:
                 if self._utils.is_metrics_collection_allowed(port_id):
                     self._metricsutils.enable_port_metrics_collection(port_id)
-                    LOG.info(_LI('Port metrics enabled for port: %s'), port_id)
+                    LOG.info(i18n._LI('Port metrics enabled for port: %s'),
+                             port_id)
                     del self._port_metric_retries[port_id]
                 elif self._port_metric_retries[port_id] < 1:
                     self._metricsutils.enable_port_metrics_collection(port_id)
-                    LOG.error(_LE('Port metrics raw enabling for port: %s'),
-                              port_id)
+                    LOG.error(i18n._LE('Port metrics raw enabling for port:'
+                                       ' %(port_id)s'), {"port_id": port_id})
                     del self._port_metric_retries[port_id]
                 else:
                     self._port_metric_retries[port_id] -= 1
             except exceptions.NotFound:
                 # the vNIC no longer exists. it might have been removed or
                 # the VM it was attached to was destroyed.
-                LOG.warning(_LW("Port %s no longer exists. Cannot enable "
-                                "metrics."), port_id)
+                LOG.warning(i18n._LW("Port %s no longer exists. Cannot enable "
+                                     "metrics."), port_id)
                 del self._port_metric_retries[port_id]
 
     @_port_synchronized
@@ -314,166 +283,57 @@ networking-plugin-hyperv_agent.html
                              physical_network, segmentation_id)
             # check if security groups is enabled.
             # if not, teardown the security group rules
-            if self.enable_security_groups:
-                self.sec_groups_agent.refresh_firewall([port_id])
+            if self._enable_security_groups:
+                self._sec_groups_agent.refresh_firewall([port_id])
             else:
                 self._utils.remove_all_security_rules(port_id)
         else:
             self._port_unbound(port_id)
-            self.sec_groups_agent.remove_devices_filter([port_id])
+            self._sec_groups_agent.remove_devices_filter([port_id])
 
     def _process_added_port(self, device_details):
-        device = device_details['device']
-        port_id = device_details['port_id']
-
-        try:
-            self._treat_vif_port(port_id,
-                                 device_details['network_id'],
-                                 device_details['network_type'],
-                                 device_details['physical_network'],
-                                 device_details['segmentation_id'],
-                                 device_details['admin_state_up'])
-            if CONF.AGENT.enable_qos_extension:
-                self._qos_ext.handle_port(self.context, device_details)
-
-            LOG.debug("Updating cached port %s status as UP.", port_id)
-            self._update_port_status_cache(device, device_bound=True)
-            LOG.info("Port %s processed.", port_id)
-        except Exception:
-            LOG.exception(_LE("Exception encountered while processing port "
-                              "%s."), port_id)
-
-            # readd the port as "added", so it can be reprocessed.
-            self._added_ports.add(device)
-
-    def _treat_devices_added(self):
-        try:
-            devices_details_list = self.plugin_rpc.get_devices_details_list(
-                self.context,
-                self._added_ports,
-                self.agent_id)
-        except Exception as e:
-            LOG.debug("Unable to get ports details for "
-                      "devices %(devices)s: %(e)s",
-                      {'devices': self._added_ports, 'e': e})
-            return
-
-        for device_details in devices_details_list:
-            device = device_details['device']
-            LOG.info(_LI("Adding port %s"), device)
-            if 'port_id' in device_details:
-                LOG.info(_LI("Port %(device)s updated. Details: "
-                             "%(device_details)s"),
-                         {'device': device, 'device_details': device_details})
-
-                eventlet.spawn_n(self._process_added_port, device_details)
-
-            # remove the port from added ports set, so it doesn't get
-            # reprocessed.
-            self._added_ports.discard(device)
-
-    def _treat_devices_removed(self):
-        for device in self._removed_ports.copy():
-            eventlet.spawn_n(self._process_removed_port, device)
+        super(HyperVNeutronAgent, self)._process_added_port(device_details)
+        if self._config.AGENT.enable_qos_extension:
+            self._qos_ext.handle_port(self._context, device_details)
 
     def _process_removed_port(self, device):
-        self._update_port_status_cache(device, device_bound=False)
+        super(HyperVNeutronAgent, self)._process_removed_port(device)
+        self._sec_groups_agent.remove_devices_filter([device])
 
-        self._port_unbound(device, vnic_deleted=True)
-        self.sec_groups_agent.remove_devices_filter([device])
+    def _work(self):
+        """Process the information regarding the available ports."""
+        super(HyperVNeutronAgent, self)._work()
+        if self._nvgre_enabled:
+            self._nvgre_ops.refresh_nvgre_records()
+        self._port_enable_control_metrics()
 
-        # if the port unbind was successful, remove the port from removed
-        # set, so it won't be reprocessed.
-        self._removed_ports.discard(device)
-
-    def _process_added_port_event(self, port_name):
-        LOG.info(_LI("Hyper-V VM vNIC added: %s"), port_name)
-        self._added_ports.add(port_name)
-
-    def _process_removed_port_event(self, port_name):
-        LOG.info(_LI("Hyper-V VM vNIC removed: %s"), port_name)
-        self._removed_ports.add(port_name)
-
-    def _create_event_listeners(self):
-        event_callback_pairs = [
-            (self._utils.EVENT_TYPE_CREATE, self._process_added_port_event),
-            (self._utils.EVENT_TYPE_DELETE, self._process_removed_port_event)]
-
-        for event_type, callback in event_callback_pairs:
-            listener = self._utils.get_vnic_event_listener(event_type)
-            eventlet.spawn_n(listener, callback)
-
-    def _update_port_status_cache(self, device, device_bound=True):
-        with self._cache_lock:
-            if device_bound:
-                self._bound_ports.add(device)
-                self._unbound_ports.discard(device)
-            else:
-                self._bound_ports.discard(device)
-                self._unbound_ports.add(device)
-
-    @synchronized('n-plugin-notifier')
+    @_synchronized('n-plugin-notifier')
     def _notify_plugin_on_port_updates(self):
-        if not (self._bound_ports or self._unbound_ports):
+        super(HyperVNeutronAgent, self)._notify_plugin_on_port_updates()
+
+    def tunnel_update(self, context, **kwargs):
+        LOG.info(i18n._LI('tunnel_update received: kwargs: %s'), kwargs)
+        tunnel_ip = kwargs.get('tunnel_ip')
+        if tunnel_ip == self._config.NVGRE.provider_tunnel_ip:
+            # the notification should be ignored if it originates from this
+            # node.
             return
 
-        with self._cache_lock:
-            bound_ports = self._bound_ports.copy()
-            unbound_ports = self._unbound_ports.copy()
+        tunnel_type = kwargs.get('tunnel_type')
+        self._nvgre_ops.tunnel_update(context, tunnel_ip, tunnel_type)
 
-        self.plugin_rpc.update_device_list(self.context,
-                                           list(bound_ports),
-                                           list(unbound_ports),
-                                           self.agent_id,
-                                           self._host)
+    def lookup_update(self, context, **kwargs):
+        self._nvgre_ops.lookup_update(kwargs)
 
-        with self._cache_lock:
-            self._bound_ports = self._bound_ports.difference(bound_ports)
-            self._unbound_ports = self._unbound_ports.difference(
-                unbound_ports)
 
-    def daemon_loop(self):
-        # The following sets contain ports that are to be processed.
-        self._added_ports = self._utils.get_vnic_ids()
-        self._removed_ports = set()
-        # The following sets contain ports that have been processed.
-        self._bound_ports = set()
-        self._unbound_ports = set()
+def main():
+    """The entry point for the HNV Agent."""
+    neutron_config.register_agent_state_opts_helper(cfg.CONF)
+    common_config.init(sys.argv[1:])
+    neutron_config.setup_logging()
 
-        self._create_event_listeners()
+    hyperv_agent = HyperVNeutronAgent(cfg.CONF)
 
-        while True:
-            try:
-                start = time.time()
-
-                eventlet.spawn_n(self._notify_plugin_on_port_updates)
-
-                # notify plugin about port deltas
-                if self._added_ports:
-                    LOG.debug("Agent loop has new devices!")
-                    self._treat_devices_added()
-
-                if self._removed_ports:
-                    LOG.debug("Agent loop has lost devices...")
-                    self._treat_devices_removed()
-
-                if self._nvgre_enabled:
-                    self._nvgre_ops.refresh_nvgre_records()
-                self._port_enable_control_metrics()
-            except Exception:
-                LOG.exception(_LE("Error in agent event loop"))
-
-                # inconsistent cache might cause exceptions. for example, if a
-                # port has been removed, it will be known in the next loop.
-                # using the old switch port can cause exceptions.
-                self._utils.update_cache()
-
-            # sleep till end of polling interval
-            elapsed = (time.time() - start)
-            if (elapsed < self._polling_interval):
-                time.sleep(self._polling_interval - elapsed)
-            else:
-                LOG.debug("Loop iteration exceeded interval "
-                          "(%(polling_interval)s vs. %(elapsed)s)",
-                          {'polling_interval': self._polling_interval,
-                           'elapsed': elapsed})
+    # Start everything.
+    LOG.info(i18n._LI("Agent initialized successfully, now running... "))
+    hyperv_agent.daemon_loop()
